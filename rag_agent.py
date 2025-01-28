@@ -1,92 +1,85 @@
-import os
 from dataclasses import dataclass
-from typing import List, Optional
-
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from typing import List
 from pydantic_ai import Agent, RunContext
-import pinecone
-from openai import OpenAI
+from openai import AsyncOpenAI
+from pinecone import Pinecone
+from config import (
+    OPENAI_API_KEY, 
+    PINECONE_API_KEY, 
+    PINECONE_ENVIRONMENT, 
+    PINECONE_INDEX_NAME
+)
 
-load_dotenv()
+# Initialize Pinecone with new client
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(PINECONE_INDEX_NAME)
 
 @dataclass
-class RAGDependencies:
-    pinecone_index: pinecone.Index
-    openai_client: OpenAI
+class Deps:
+    openai: AsyncOpenAI
+    pinecone_index: Pinecone.Index
+
+# Initialize the agent
+rag_agent = Agent(
+    "openai:gpt-4",
+    system_prompt=(
+        "You are a helpful assistant that answers questions based on the retrieved context. "
+        "Always use the retrieved information to formulate your answers. "
+        "If you cannot find relevant information in the context, say so."
+    ),
+    deps_type=Deps
+)
+
+@rag_agent.tool
+async def retrieve(context: RunContext[Deps], query: str) -> str:
+    """Retrieve relevant documents based on the query using vector similarity search.
     
-class SearchResult(BaseModel):
-    answer: str = Field(description='The answer to the user query')
-    sources: List[str] = Field(description='The sources used to generate the answer')
-    confidence: float = Field(description='Confidence score of the answer', ge=0, le=1)
+    Args:
+        context: The run context containing dependencies
+        query: The search query
+    
+    Returns:
+        str: Retrieved context from the vector database
+    """
+    # Generate embedding for the query
+    embedding_response = await context.deps.openai.embeddings.create(
+        input=query,
+        model="text-embedding-3-small"
+    )
+    query_embedding = embedding_response.data[0].embedding
+    
+    # Search Pinecone
+    search_results = context.deps.pinecone_index.query(
+        vector=query_embedding,
+        top_k=3,
+        include_metadata=True
+    )
+    
+    # Format results
+    contexts = []
+    for match in search_results.matches:
+        if match.score > 0.7:  # Only include relevant matches
+            contexts.append(f"Context (relevance: {match.score:.2f}):\n{match.metadata['text']}")
+    
+    return "\n\n".join(contexts) if contexts else "No relevant context found."
 
-class RAGAgent:
-    def __init__(self):
-        # Initialize OpenAI client
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+async def query_rag_agent(question: str) -> str:
+    """Query the RAG agent with a question.
+    
+    Args:
+        question: The question to ask
         
-        # Initialize Pinecone
-        pinecone.init(
-            api_key=os.getenv("PINECONE_API_KEY"),
-            environment=os.getenv("PINECONE_ENVIRONMENT")
-        )
-        self.index = pinecone.Index(os.getenv("PINECONE_INDEX_NAME"))
-        
-        # Initialize PydanticAI agent
-        self.agent = Agent(
-            'openai:gpt-4',
-            deps_type=RAGDependencies,
-            result_type=SearchResult,
-            system_prompt=(
-                'You are a helpful assistant that answers questions based on the retrieved context. '
-                'Always provide accurate information and cite your sources.'
-            )
-        )
-        
-        self.deps = RAGDependencies(
-            pinecone_index=self.index,
-            openai_client=self.openai_client
-        )
-
-    async def _get_embeddings(self, text: str) -> List[float]:
-        """Generate embeddings for the input text using OpenAI."""
-        response = await self.openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text
-        )
-        return response.data[0].embedding
-
-    @Agent.tool
-    async def search_context(self, ctx: RunContext[RAGDependencies], query: str) -> List[dict]:
-        """Search for relevant context in the vector database."""
-        query_embedding = await self._get_embeddings(query)
-        results = ctx.deps.pinecone_index.query(
-            vector=query_embedding,
-            top_k=3,
-            include_metadata=True
-        )
-        return [
-            {
-                'content': match.metadata.get('content', ''),
-                'source': match.metadata.get('source', 'Unknown'),
-                'score': match.score
-            }
-            for match in results.matches
-        ]
-
-    async def query(self, question: str) -> SearchResult:
-        """Query the RAG system with a question."""
-        result = await self.agent.run(question, deps=self.deps)
-        return result.data
-
-async def main():
-    # Example usage
-    rag = RAGAgent()
-    result = await rag.query("What is the capital of France?")
-    print(f"Answer: {result.answer}")
-    print(f"Sources: {result.sources}")
-    print(f"Confidence: {result.confidence}")
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    Returns:
+        str: The agent's response
+    """
+    # Initialize dependencies
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    deps = Deps(openai=openai_client, pinecone_index=index)
+    
+    # Run the agent
+    result = await rag_agent.run(
+        f"Use the retrieve tool to find relevant information and answer this question: {question}",
+        deps=deps
+    )
+    
+    return result.data 
